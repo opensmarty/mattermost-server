@@ -57,7 +57,7 @@ func (a *App) SyncPluginsActiveState() {
 		}
 
 		// Deactivate any plugins that have been disabled.
-		for _, plugin := range pluginsEnvironment.Active() {
+		for _, plugin := range availablePlugins {
 			// Determine if plugin is enabled
 			pluginId := plugin.Manifest.Id
 			pluginEnabled := false
@@ -286,6 +286,7 @@ func (a *App) DisablePlugin(id string) *model.AppError {
 	a.UpdateConfig(func(cfg *model.Config) {
 		cfg.PluginSettings.PluginStates[id] = &model.PluginState{Enable: false}
 	})
+	a.UnregisterPluginCommands(id)
 
 	if err := a.SaveConfig(a.Config(), true); err != nil {
 		return model.NewAppError("DisablePlugin", "app.plugin.config.app_error", nil, err.Error(), http.StatusInternalServerError)

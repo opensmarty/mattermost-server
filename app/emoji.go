@@ -31,6 +31,14 @@ const (
 )
 
 func (a *App) CreateEmoji(sessionUserId string, emoji *model.Emoji, multiPartImageData *multipart.Form) (*model.Emoji, *model.AppError) {
+	if !*a.Config().ServiceSettings.EnableCustomEmoji {
+		return nil, model.NewAppError("UploadEmojiImage", "api.emoji.disabled.app_error", nil, "", http.StatusNotImplemented)
+	}
+
+	if len(*a.Config().FileSettings.DriverName) == 0 {
+		return nil, model.NewAppError("GetEmoji", "api.emoji.storage.app_error", nil, "", http.StatusNotImplemented)
+	}
+
 	// wipe the emoji id so that existing emojis can't get overwritten
 	emoji.Id = ""
 
@@ -45,7 +53,7 @@ func (a *App) CreateEmoji(sessionUserId string, emoji *model.Emoji, multiPartIma
 		return nil, model.NewAppError("createEmoji", "api.emoji.create.other_user.app_error", nil, "", http.StatusForbidden)
 	}
 
-	if result := <-a.Srv.Store.Emoji().GetByName(emoji.Name); result.Err == nil && result.Data != nil {
+	if existingEmoji, err := a.Srv.Store.Emoji().GetByName(emoji.Name); err == nil && existingEmoji != nil {
 		return nil, model.NewAppError("createEmoji", "api.emoji.create.duplicate.app_error", nil, "", http.StatusBadRequest)
 	}
 
@@ -59,26 +67,30 @@ func (a *App) CreateEmoji(sessionUserId string, emoji *model.Emoji, multiPartIma
 		return nil, err
 	}
 
-	result := <-a.Srv.Store.Emoji().Save(emoji)
-	if result.Err != nil {
-		return nil, result.Err
+	emoji, err := a.Srv.Store.Emoji().Save(emoji)
+	if err != nil {
+		return nil, err
 	}
 
 	message := model.NewWebSocketEvent(model.WEBSOCKET_EVENT_EMOJI_ADDED, "", "", "", nil)
 	message.Add("emoji", emoji.ToJson())
 	a.Publish(message)
-	return result.Data.(*model.Emoji), nil
+	return emoji, nil
 }
 
 func (a *App) GetEmojiList(page, perPage int, sort string) ([]*model.Emoji, *model.AppError) {
-	result := <-a.Srv.Store.Emoji().GetList(page*perPage, perPage, sort)
-	if result.Err != nil {
-		return nil, result.Err
-	}
-	return result.Data.([]*model.Emoji), nil
+	return a.Srv.Store.Emoji().GetList(page*perPage, perPage, sort)
 }
 
 func (a *App) UploadEmojiImage(id string, imageData *multipart.FileHeader) *model.AppError {
+	if !*a.Config().ServiceSettings.EnableCustomEmoji {
+		return model.NewAppError("UploadEmojiImage", "api.emoji.disabled.app_error", nil, "", http.StatusNotImplemented)
+	}
+
+	if len(*a.Config().FileSettings.DriverName) == 0 {
+		return model.NewAppError("UploadEmojiImage", "api.emoji.storage.app_error", nil, "", http.StatusNotImplemented)
+	}
+
 	file, err := imageData.Open()
 	if err != nil {
 		return model.NewAppError("uploadEmojiImage", "api.emoji.upload.open.app_error", nil, "", http.StatusBadRequest)
@@ -144,7 +156,7 @@ func (a *App) UploadEmojiImage(id string, imageData *multipart.FileHeader) *mode
 }
 
 func (a *App) DeleteEmoji(emoji *model.Emoji) *model.AppError {
-	if err := (<-a.Srv.Store.Emoji().Delete(emoji.Id, model.GetMillis())).Err; err != nil {
+	if err := a.Srv.Store.Emoji().Delete(emoji.Id, model.GetMillis()); err != nil {
 		return err
 	}
 
@@ -162,11 +174,7 @@ func (a *App) GetEmoji(emojiId string) (*model.Emoji, *model.AppError) {
 		return nil, model.NewAppError("GetEmoji", "api.emoji.storage.app_error", nil, "", http.StatusNotImplemented)
 	}
 
-	result := <-a.Srv.Store.Emoji().Get(emojiId, false)
-	if result.Err != nil {
-		return nil, result.Err
-	}
-	return result.Data.(*model.Emoji), nil
+	return a.Srv.Store.Emoji().Get(emojiId, false)
 }
 
 func (a *App) GetEmojiByName(emojiName string) (*model.Emoji, *model.AppError) {
@@ -178,11 +186,7 @@ func (a *App) GetEmojiByName(emojiName string) (*model.Emoji, *model.AppError) {
 		return nil, model.NewAppError("GetEmoji", "api.emoji.storage.app_error", nil, "", http.StatusNotImplemented)
 	}
 
-	result := <-a.Srv.Store.Emoji().GetByName(emojiName)
-	if result.Err != nil {
-		return nil, result.Err
-	}
-	return result.Data.(*model.Emoji), nil
+	return a.Srv.Store.Emoji().GetByName(emojiName)
 }
 
 func (a *App) GetMultipleEmojiByName(names []string) ([]*model.Emoji, *model.AppError) {
@@ -190,17 +194,13 @@ func (a *App) GetMultipleEmojiByName(names []string) ([]*model.Emoji, *model.App
 		return nil, model.NewAppError("GetMultipleEmojiByName", "api.emoji.disabled.app_error", nil, "", http.StatusNotImplemented)
 	}
 
-	if result := <-a.Srv.Store.Emoji().GetMultipleByName(names); result.Err != nil {
-		return nil, result.Err
-	} else {
-		return result.Data.([]*model.Emoji), nil
-	}
+	return a.Srv.Store.Emoji().GetMultipleByName(names)
 }
 
 func (a *App) GetEmojiImage(emojiId string) ([]byte, string, *model.AppError) {
-	result := <-a.Srv.Store.Emoji().Get(emojiId, true)
-	if result.Err != nil {
-		return nil, "", result.Err
+	_, storeErr := a.Srv.Store.Emoji().Get(emojiId, true)
+	if storeErr != nil {
+		return nil, "", storeErr
 	}
 
 	img, appErr := a.ReadFile(getEmojiImagePath(emojiId))
@@ -221,11 +221,7 @@ func (a *App) SearchEmoji(name string, prefixOnly bool, limit int) ([]*model.Emo
 		return nil, model.NewAppError("SearchEmoji", "api.emoji.disabled.app_error", nil, "", http.StatusNotImplemented)
 	}
 
-	result := <-a.Srv.Store.Emoji().Search(name, prefixOnly, limit)
-	if result.Err != nil {
-		return nil, result.Err
-	}
-	return result.Data.([]*model.Emoji), nil
+	return a.Srv.Store.Emoji().Search(name, prefixOnly, limit)
 }
 
 func resizeEmojiGif(gifImg *gif.GIF) *gif.GIF {
@@ -276,8 +272,8 @@ func (a *App) deleteEmojiImage(id string) {
 }
 
 func (a *App) deleteReactionsForEmoji(emojiName string) {
-	if result := <-a.Srv.Store.Reaction().DeleteAllWithEmojiName(emojiName); result.Err != nil {
+	if err := a.Srv.Store.Reaction().DeleteAllWithEmojiName(emojiName); err != nil {
 		mlog.Warn(fmt.Sprintf("Unable to delete reactions when deleting emoji with emoji name %v", emojiName))
-		mlog.Warn(fmt.Sprint(result.Err))
+		mlog.Warn(fmt.Sprint(err))
 	}
 }

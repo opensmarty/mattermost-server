@@ -8,8 +8,6 @@ import (
 	"crypto/ecdsa"
 	"crypto/tls"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/url"
@@ -19,23 +17,24 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 	"github.com/pkg/errors"
 	"github.com/rs/cors"
+	analytics "github.com/segmentio/analytics-go"
 	"github.com/throttled/throttled"
 	"golang.org/x/crypto/acme/autocert"
 
+	"github.com/mattermost/mattermost-server/config"
 	"github.com/mattermost/mattermost-server/einterfaces"
 	"github.com/mattermost/mattermost-server/jobs"
 	"github.com/mattermost/mattermost-server/mlog"
 	"github.com/mattermost/mattermost-server/model"
 	"github.com/mattermost/mattermost-server/plugin"
 	"github.com/mattermost/mattermost-server/services/httpservice"
+	"github.com/mattermost/mattermost-server/services/imageproxy"
 	"github.com/mattermost/mattermost-server/services/timezones"
 	"github.com/mattermost/mattermost-server/store"
 	"github.com/mattermost/mattermost-server/utils"
-	"github.com/mattermost/mattermost-server/utils/fileutils"
 )
 
 var MaxNotificationsPerChannelDefault int64 = 1000000
@@ -75,10 +74,6 @@ type Server struct {
 	runjobs bool
 	Jobs    *jobs.JobServer
 
-	config                 atomic.Value
-	envConfig              map[string]interface{}
-	configFile             string
-	configListeners        map[string]func(*model.Config, *model.Config)
 	clusterLeaderListeners sync.Map
 
 	licenseValue       atomic.Value
@@ -96,9 +91,9 @@ type Server struct {
 	licenseListenerId       string
 	logListenerId           string
 	clusterLeaderListenerId string
-	disableConfigWatch      bool
-	configWatcher           *utils.ConfigWatcher
+	configStore             config.Store
 	asymmetricSigningKey    *ecdsa.PrivateKey
+	postActionCookieSecret  []byte
 
 	pluginCommands     []*PluginCommand
 	pluginCommandsLock sync.RWMutex
@@ -106,13 +101,22 @@ type Server struct {
 	clientConfig        map[string]string
 	clientConfigHash    string
 	limitedClientConfig map[string]string
-	diagnosticId        string
+
+	diagnosticId     string
+	diagnosticClient *analytics.Client
 
 	phase2PermissionsMigrationComplete bool
 
 	HTTPService httpservice.HTTPService
 
-	Log *mlog.Logger
+	ImageProxy *imageproxy.ImageProxy
+
+	Log              *mlog.Logger
+	NotificationsLog *mlog.Logger
+
+	joinCluster        bool
+	startMetrics       bool
+	startElasticsearch bool
 
 	AccountMigration einterfaces.AccountMigrationInterface
 	Cluster          einterfaces.ClusterInterface
@@ -131,25 +135,35 @@ func NewServer(options ...Option) (*Server, error) {
 	s := &Server{
 		goroutineExitSignal:     make(chan struct{}, 1),
 		RootRouter:              rootRouter,
-		configFile:              "config.json",
-		configListeners:         make(map[string]func(*model.Config, *model.Config)),
 		licenseListeners:        map[string]func(){},
 		sessionCache:            utils.NewLru(model.SESSION_CACHE_SIZE),
 		seenPendingPostIdsCache: utils.NewLru(PENDING_POST_IDS_CACHE_SIZE),
 		clientConfig:            make(map[string]string),
 	}
 	for _, option := range options {
-		option(s)
+		if err := option(s); err != nil {
+			return nil, errors.Wrap(err, "failed to apply option")
+		}
 	}
 
-	if err := s.LoadConfig(s.configFile); err != nil {
-		return nil, err
+	if s.configStore == nil {
+		configStore, err := config.NewFileStore("config.json", true)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to load config")
+		}
+
+		s.configStore = configStore
 	}
 
-	s.EnableConfigWatch()
+	if s.Log == nil {
+		s.Log = mlog.NewLogger(utils.MloggerConfigFromLoggerConfig(&s.Config().LogSettings, utils.GetLogFileLocation))
+	}
 
-	// Initalize logging
-	s.Log = mlog.NewLogger(utils.MloggerConfigFromLoggerConfig(&s.Config().LogSettings))
+	if s.NotificationsLog == nil {
+		notificationLogSettings := utils.GetLogSettingsFromNotificationsLogSettings(&s.Config().NotificationLogSettings)
+		s.NotificationsLog = mlog.NewLogger(utils.MloggerConfigFromLoggerConfig(notificationLogSettings, utils.GetNotificationsLogFileLocation)).
+			WithCallerSkip(1).With(mlog.String("logSource", "notifications"))
+	}
 
 	// Redirect default golang logger to this logger
 	mlog.RedirectStdLog(s.Log)
@@ -158,15 +172,18 @@ func NewServer(options ...Option) (*Server, error) {
 	mlog.InitGlobalLogger(s.Log)
 
 	s.logListenerId = s.AddConfigListener(func(_, after *model.Config) {
-		s.Log.ChangeLevels(utils.MloggerConfigFromLoggerConfig(&after.LogSettings))
+		s.Log.ChangeLevels(utils.MloggerConfigFromLoggerConfig(&after.LogSettings, utils.GetLogFileLocation))
+
+		notificationLogSettings := utils.GetLogSettingsFromNotificationsLogSettings(&after.NotificationLogSettings)
+		s.NotificationsLog.ChangeLevels(utils.MloggerConfigFromLoggerConfig(notificationLogSettings, utils.GetNotificationsLogFileLocation))
 	})
 
 	s.HTTPService = httpservice.MakeHTTPService(s.FakeApp())
 
-	if utils.T == nil {
-		if err := utils.TranslationsPreInit(); err != nil {
-			return nil, errors.Wrapf(err, "unable to load Mattermost translation files")
-		}
+	s.ImageProxy = imageproxy.MakeImageProxy(s, s.HTTPService, s.Log)
+
+	if err := utils.TranslationsPreInit(); err != nil {
+		return nil, errors.Wrapf(err, "unable to load Mattermost translation files")
 	}
 
 	err := s.RunOldAppInitalization()
@@ -176,7 +193,7 @@ func NewServer(options ...Option) (*Server, error) {
 
 	model.AppErrorInit(utils.T)
 
-	s.timezones = timezones.New("")
+	s.timezones = timezones.New()
 
 	// Start email batching because it's not like the other jobs
 	s.InitEmailBatching()
@@ -184,11 +201,19 @@ func NewServer(options ...Option) (*Server, error) {
 		s.InitEmailBatching()
 	})
 
+	// Start plugin health check job
+	pluginsEnvironment := s.PluginsEnvironment
+	if pluginsEnvironment != nil {
+		pluginsEnvironment.InitPluginHealthCheckJob()
+	}
+
 	mlog.Info(fmt.Sprintf("Current version is %v (%v/%v/%v/%v)", model.CurrentVersion, model.BuildNumber, model.BuildDate, model.BuildHash, model.BuildHashEnterprise))
 	mlog.Info(fmt.Sprintf("Enterprise Enabled: %v", model.BuildEnterpriseReady))
 	pwd, _ := os.Getwd()
 	mlog.Info(fmt.Sprintf("Current working directory is %v", pwd))
-	mlog.Info(fmt.Sprintf("Loaded config file from %v", fileutils.FindConfigFile(s.configFile)))
+	mlog.Info("Loaded config", mlog.String("source", s.configStore.String()))
+
+	s.checkPushNotificationServerUrl()
 
 	license := s.License()
 
@@ -212,20 +237,20 @@ func NewServer(options ...Option) (*Server, error) {
 		s.UpdateConfig(func(cfg *model.Config) { *cfg.ServiceSettings.EnableDeveloper = true })
 	}
 
-	if result := <-s.Store.Status().ResetAll(); result.Err != nil {
-		mlog.Error(fmt.Sprint("Error to reset the server status.", result.Err.Error()))
+	if err := s.Store.Status().ResetAll(); err != nil {
+		mlog.Error(fmt.Sprint("Error to reset the server status.", err.Error()))
 	}
 
-	if s.Cluster != nil {
+	if s.joinCluster && s.Cluster != nil {
 		s.FakeApp().RegisterAllClusterMessageHandlers()
 		s.Cluster.StartInterNodeCommunication()
 	}
 
-	if s.Metrics != nil {
+	if s.startMetrics && s.Metrics != nil {
 		s.Metrics.StartServer()
 	}
 
-	if s.Elasticsearch != nil {
+	if s.startElasticsearch && s.Elasticsearch != nil {
 		s.StartElasticsearch()
 	}
 
@@ -299,6 +324,11 @@ func (s *Server) Shutdown() error {
 
 	s.RunOldAppShutdown()
 
+	err := s.shutdownDiagnostics()
+	if err != nil {
+		mlog.Error(fmt.Sprintf("Unable to cleanly shutdown diagnostic client: %s", err))
+	}
+
 	s.StopHTTPServer()
 	s.WaitForGoroutines()
 
@@ -313,7 +343,7 @@ func (s *Server) Shutdown() error {
 	s.RemoveConfigListener(s.configListenerId)
 	s.RemoveConfigListener(s.logListenerId)
 
-	s.DisableConfigWatch()
+	s.configStore.Close()
 
 	if s.Cluster != nil {
 		s.Cluster.StopInterNodeCommunication()
@@ -364,14 +394,6 @@ var corsAllowedMethods = []string{
 	"DELETE",
 }
 
-type RecoveryLogger struct {
-}
-
-func (rl *RecoveryLogger) Println(i ...interface{}) {
-	mlog.Error("Please check the std error output for the stack trace")
-	mlog.Error(fmt.Sprint(i...))
-}
-
 // golang.org/x/crypto/acme/autocert/autocert.go
 func handleHTTPRedirect(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" && r.Method != "HEAD" {
@@ -420,7 +442,7 @@ func (s *Server) Start() error {
 	if *s.Config().RateLimitSettings.Enable {
 		mlog.Info("RateLimiter is enabled")
 
-		rateLimiter, err := NewRateLimiter(&s.Config().RateLimitSettings)
+		rateLimiter, err := NewRateLimiter(&s.Config().RateLimitSettings, s.Config().ServiceSettings.TrustedProxyIPHeader)
 		if err != nil {
 			return err
 		}
@@ -429,11 +451,17 @@ func (s *Server) Start() error {
 		handler = rateLimiter.RateLimitHandler(handler)
 	}
 
+	// Creating a logger for logging errors from http.Server at error level
+	errStdLog, err := s.Log.StdLogAt(mlog.LevelError, mlog.String("source", "httpserver"))
+	if err != nil {
+		return err
+	}
+
 	s.Server = &http.Server{
-		Handler:      handlers.RecoveryHandler(handlers.RecoveryLogger(&RecoveryLogger{}), handlers.PrintRecoveryStack(true))(handler),
+		Handler:      handler,
 		ReadTimeout:  time.Duration(*s.Config().ServiceSettings.ReadTimeout) * time.Second,
 		WriteTimeout: time.Duration(*s.Config().ServiceSettings.WriteTimeout) * time.Second,
-		ErrorLog:     s.Log.StdLog(mlog.String("source", "httpserver")),
+		ErrorLog:     errStdLog,
 	}
 
 	addr := *s.Config().ServiceSettings.ListenAddress
@@ -596,11 +624,10 @@ func (a *App) OriginChecker() func(*http.Request) bool {
 	return nil
 }
 
-// This is required to re-use the underlying connection and not take up file descriptors
-func consumeAndClose(r *http.Response) {
-	if r.Body != nil {
-		io.Copy(ioutil.Discard, r.Body)
-		r.Body.Close()
+func (s *Server) checkPushNotificationServerUrl() {
+	notificationServer := *s.Config().EmailSettings.PushNotificationServer
+	if strings.HasPrefix(notificationServer, "http://") == true {
+		mlog.Warn("Your push notification server is configured with HTTP. For improved security, update to HTTPS in your configuration.")
 	}
 }
 
@@ -714,4 +741,31 @@ func (s *Server) StartElasticsearch() {
 			})
 		}
 	})
+}
+
+func (s *Server) initDiagnostics(endpoint string) {
+	if s.diagnosticClient == nil {
+		client := analytics.New(SEGMENT_KEY)
+		client.Logger = s.Log.StdLog(mlog.String("source", "segment"))
+		// For testing
+		if endpoint != "" {
+			client.Endpoint = endpoint
+			client.Verbose = true
+			client.Size = 1
+		}
+		client.Identify(&analytics.Identify{
+			UserId: s.diagnosticId,
+		})
+
+		s.diagnosticClient = client
+	}
+}
+
+// ShutdownDiagnostics closes the diagnostic client.
+func (s *Server) shutdownDiagnostics() error {
+	if s.diagnosticClient != nil {
+		return s.diagnosticClient.Close()
+	}
+
+	return nil
 }

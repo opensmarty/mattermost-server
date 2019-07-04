@@ -11,7 +11,10 @@ pipeline {
         label 'default-mm-builder'
     }
 
-    options { buildDiscarder(logRotator(numToKeepStr: '3')) }
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '3'))
+        timeout(time: 1, unit: 'HOURS')
+    }
 
     environment {
         COMPOSE_PROJECT_NAME="${rnd}-${env.BUILD_NUMBER}"
@@ -42,7 +45,7 @@ pipeline {
                     ansiColor('xterm') {
                         sh """
                             #!/bin/bash -ex
-                            git checkout $env.BRANCH_NAME || git checkout $env.CHANGE_BRANCH || git checkout $env.GIT_BRANCH || git checkout master || echo 1
+                            git checkout $env.BRANCH_NAME || git checkout $env.CHANGE_BRANCH || git checkout $env.GIT_BRANCH || git checkout $env.CHANGE_TARGET || git checkout master || echo 1
                             export EE_GIT_COMMIT=\$(git rev-parse HEAD)
 
                             echo EE Commit: \${EE_GIT_COMMIT}
@@ -54,7 +57,7 @@ pipeline {
                         ansiColor('xterm') {
                             sh """
                                 #!/bin/bash -ex
-                                git checkout $env.BRANCH_NAME || git checkout $env.CHANGE_BRANCH || git checkout $env.GIT_BRANCH || git checkout master
+                                git checkout $env.BRANCH_NAME || git checkout $env.CHANGE_BRANCH || git checkout $env.GIT_BRANCH || git checkout $env.CHANGE_TARGET || git checkout master
                                 rm -rf ./dist
                                 export WEBAPP_GIT_COMMIT=\$(git rev-parse HEAD)
 
@@ -68,17 +71,36 @@ pipeline {
             }
         }
 
+        stage('Check i18n') {
+            environment {
+                GOPATH = "/go"
+            }
+
+            steps {
+                withDockerContainer(args: '-u root --privileged -v ${WORKSPACE}/src:/go/src/', image: 'mattermost/mattermost-build-server:feb-28-2019') {
+                    ansiColor('xterm') {
+                        sh """
+                            cd /go/src/github.com/mattermost/mattermost-server
+                            cp i18n/en.json /tmp/en.json
+                            make i18n-extract
+                            diff /tmp/en.json i18n/en.json
+                        """
+                    }
+                }
+            }
+        }
+
         stage('Build') {
             environment {
                 GOPATH = "/go"
             }
 
             steps {
-                withDockerContainer(args: '-u root --privileged -v ${WORKSPACE}/src:/go/src/', image: 'mattermost/mattermost-build-server:dec-7-2018') {
+                withDockerContainer(args: '-u root --privileged -v ${WORKSPACE}/src:/go/src/', image: 'mattermost/mattermost-build-server:feb-28-2019') {
                     ansiColor('xterm') {
                         sh """
                             cd /go/src/github.com/mattermost/mattermost-server
-                            mv config/default.json config/config.json || echo ""
+                            make config-reset
                             make check-style BUILD_NUMBER='${BRANCH_NAME}-${BUILD_NUMBER}'
                             make build BUILD_NUMBER='${BRANCH_NAME}-${BUILD_NUMBER}'
                             make package BUILD_NUMBER='${BRANCH_NAME}-${BUILD_NUMBER}'
@@ -105,6 +127,7 @@ pipeline {
                 MM_EMAILSETTINGS_SMTPSERVER = "inbucket"
                 MM_EMAILSETTINGS_SMTPPORT = "10025"
                 MM_ELASTICSEARCHSETTINGS_CONNECTIONURL = "http://elasticsearch:9200"
+                LDAP_DATA = "test"
             }
 
             steps {
@@ -113,27 +136,28 @@ pipeline {
                         sh """
                             docker-compose --no-ansi run --rm start_dependencies
                             docker-compose --no-ansi ps
-
-                            docker-compose --no-ansi exec -T openldap bash -c 'echo -e "dn: ou=testusers,dc=mm,dc=test,dc=com\nobjectclass: organizationalunit" | ldapadd -x -D "cn=admin,dc=mm,dc=test,dc=com" -w mostest';
-                            docker-compose --no-ansi exec -T openldap bash -c 'echo -e "dn: uid=test.one,ou=testusers,dc=mm,dc=test,dc=com\nobjectclass: iNetOrgPerson\nsn: User\ncn: Test1\nmail: success+testone@simulator.amazonses.com" | ldapadd -x -D "cn=admin,dc=mm,dc=test,dc=com" -w mostest';
-                            docker-compose --no-ansi exec -T openldap bash -c 'ldappasswd -s Password1 -D "cn=admin,dc=mm,dc=test,dc=com" -x "uid=test.one,ou=testusers,dc=mm,dc=test,dc=com" -w mostest';
-                            docker-compose --no-ansi exec -T openldap bash -c 'echo -e "dn: uid=test.two,ou=testusers,dc=mm,dc=test,dc=com\nobjectclass: iNetOrgPerson\nsn: User\ncn: Test2\nmail: success+testtwo@simulator.amazonses.com" | ldapadd -x -D "cn=admin,dc=mm,dc=test,dc=com" -w mostest';
-                            docker-compose --no-ansi exec -T openldap bash -c 'ldappasswd -s Password1 -D "cn=admin,dc=mm,dc=test,dc=com" -x "uid=test.two,ou=testusers,dc=mm,dc=test,dc=com" -w mostest';
-                            docker-compose --no-ansi exec -T openldap bash -c 'echo -e "dn: cn=tgroup,ou=testusers,dc=mm,dc=test,dc=com\nobjectclass: groupOfUniqueNames\nuniqueMember: uid=test.one,ou=testusers,dc=mm,dc=test,dc=com" | ldapadd -x -D "cn=admin,dc=mm,dc=test,dc=com" -w mostest';
+                            docker-compose --no-ansi exec -T openldap bash -c 'ldapadd -x -D "cn=admin,dc=mm,dc=test,dc=com" -w mostest -f /${LDAP_DATA}-data.ldif';
                         """
                     }
                 }
 
-                withDockerContainer(args: "-u root --privileged --net ${COMPOSE_PROJECT_NAME}_mm-test -v ${WORKSPACE}/src:/go/src/", image: 'mattermost/mattermost-build-server:dec-7-2018') {
+                withDockerContainer(args: "-u root --privileged --net ${COMPOSE_PROJECT_NAME}_mm-test -v ${WORKSPACE}/src:/go/src/", image: 'mattermost/mattermost-build-server:feb-28-2019') {
                     ansiColor('xterm') {
-                    sh """
+                        sh """
                             cd /go/src/github.com/mattermost/mattermost-server
 
                             mkdir -p client/plugins
                             cat config/config.json
 
                             make test-server BUILD_NUMBER='${BRANCH_NAME}-${BUILD_NUMBER}' TESTFLAGS= TESTFLAGSEE=
+
                         """
+                    }
+                    withCredentials([string(credentialsId: 'CODECOV_TOKEN', variable: 'CODECOV')]) {
+                        sh '''
+                            cd /go/src/github.com/mattermost/mattermost-server
+                            curl -s https://codecov.io/bash | bash -s - -t $CODECOV || echo 'Codecov failed to upload'
+                        '''
                     }
                 }
             }
@@ -212,12 +236,41 @@ pipeline {
             }
         }
 
+        stage('Clean checkout') {
+            when {
+                expression { env.CHANGE_ID != null }
+            }
+            // We need to perform a clean checkout here to ge the original git commit hash from the PR
+            // Jenkins now merges master in top of the PR and this generate a new git hash
+            // We need to do that to build the docker image based on the original git commit and then this will be used by
+            // mattermod to update the test server.
+            steps {
+                sh """
+                    mkdir -p /tmp/mattermost-server
+                """
+                dir('/tmp/mattermost-server') {
+                    checkout([$class: 'GitSCM', branches: [[name: 'FETCH_HEAD']],
+                        doGenerateSubmoduleConfigurations: false, extensions: [],
+                        submoduleCfg: [], userRemoteConfigs:  [
+                        [refspec: "+refs/pull/${CHANGE_ID}/head:refs/remotes/origin/PR-${CHANGE_ID}",
+                        credentialsId: "310159d3-f7c5-4f5d-bfa1-151e3ef2db57",url: "https://github.com/mattermost/mattermost-server.git"]]])
+                    sh 'git rev-parse --short HEAD'
+                }
+            }
+        }
+
         stage('Trigger docker image') {
+            environment {
+                GIT_COMMIT_SHORT = sh(
+                        script: "cd /tmp/mattermost-server && printf \$(git rev-parse --short HEAD)",
+                        returnStdout: true
+                )
+            }
             when {
                 expression { env.CHANGE_ID != null }
             }
             steps {
-                build job: '../../mk/mattermost-enterprise-edition-release', parameters: [string(name: 'RELEASE', value: "${CHANGE_ID}"), booleanParam(name: 'FROM_PR', value: true)], propagate: false, wait: false
+                build job: '../../mk/mattermost-enterprise-edition-release', parameters: [string(name: 'RELEASE', value: "${CHANGE_ID}"), booleanParam(name: 'FROM_PR', value: true),string(name: 'PR_TAG', value: "${GIT_COMMIT_SHORT}")], propagate: false, wait: false
             }
         }
     }

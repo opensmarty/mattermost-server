@@ -325,7 +325,7 @@ func deauthorizeOAuthApp(c *Context, w http.ResponseWriter, r *http.Request) {
 }
 
 func authorizeOAuthPage(c *Context, w http.ResponseWriter, r *http.Request) {
-	if !c.App.Config().ServiceSettings.EnableOAuthServiceProvider {
+	if !*c.App.Config().ServiceSettings.EnableOAuthServiceProvider {
 		err := model.NewAppError("authorizeOAuth", "api.oauth.authorize_oauth.disabled.app_error", nil, "", http.StatusNotImplemented)
 		utils.RenderWebAppError(c.App.Config(), w, r, err, c.App.AsymmetricSigningKey())
 		return
@@ -515,7 +515,6 @@ func completeOAuth(c *Context, w http.ResponseWriter, r *http.Request) {
 	if action == model.OAUTH_ACTION_EMAIL_TO_SSO {
 		redirectUrl = c.GetSiteURLHeader() + "/login?extra=signin_change"
 	} else if action == model.OAUTH_ACTION_SSO_TO_EMAIL {
-
 		redirectUrl = app.GetProtocol(r) + "://" + r.Host + "/claim?email=" + url.QueryEscape(props["email"])
 	} else {
 		session, err := c.App.DoLogin(w, r, user, "")
@@ -528,9 +527,15 @@ func completeOAuth(c *Context, w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		c.App.AttachSessionCookies(w, r, session)
+
 		c.App.Session = *session
 
-		redirectUrl = c.GetSiteURLHeader()
+		if _, ok := props["redirect_to"]; ok {
+			redirectUrl = props["redirect_to"]
+		} else {
+			redirectUrl = c.GetSiteURLHeader()
+		}
 	}
 
 	if action == model.OAUTH_ACTION_MOBILE {
@@ -538,6 +543,7 @@ func completeOAuth(c *Context, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	http.Redirect(w, r, redirectUrl, http.StatusTemporaryRedirect)
 }
 

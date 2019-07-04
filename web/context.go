@@ -25,8 +25,8 @@ type Context struct {
 
 func (c *Context) LogAudit(extraInfo string) {
 	audit := &model.Audit{UserId: c.App.Session.UserId, IpAddress: c.App.IpAddress, Action: c.App.Path, ExtraInfo: extraInfo, SessionId: c.App.Session.Id}
-	if r := <-c.App.Srv.Store.Audit().Save(audit); r.Err != nil {
-		c.LogError(r.Err)
+	if err := c.App.Srv.Store.Audit().Save(audit); err != nil {
+		c.LogError(err)
 	}
 }
 
@@ -37,8 +37,8 @@ func (c *Context) LogAuditWithUserId(userId, extraInfo string) {
 	}
 
 	audit := &model.Audit{UserId: userId, IpAddress: c.App.IpAddress, Action: c.App.Path, ExtraInfo: extraInfo, SessionId: c.App.Session.Id}
-	if r := <-c.App.Srv.Store.Audit().Save(audit); r.Err != nil {
-		c.LogError(r.Err)
+	if err := c.App.Srv.Store.Audit().Save(audit); err != nil {
+		c.LogError(err)
 	}
 }
 
@@ -86,7 +86,10 @@ func (c *Context) IsSystemAdmin() bool {
 }
 
 func (c *Context) SessionRequired() {
-	if !*c.App.Config().ServiceSettings.EnableUserAccessTokens && c.App.Session.Props[model.SESSION_PROP_TYPE] == model.SESSION_TYPE_USER_ACCESS_TOKEN {
+	if !*c.App.Config().ServiceSettings.EnableUserAccessTokens &&
+		c.App.Session.Props[model.SESSION_PROP_TYPE] == model.SESSION_TYPE_USER_ACCESS_TOKEN &&
+		c.App.Session.Props[model.SESSION_PROP_IS_BOT] != model.SESSION_PROP_IS_BOT_VALUE {
+
 		c.Err = model.NewAppError("", "api.context.session_expired.app_error", nil, "UserAccessToken", http.StatusUnauthorized)
 		return
 	}
@@ -125,6 +128,11 @@ func (c *Context) MfaRequired() {
 			return
 		}
 
+		// Bots are exempt
+		if user.IsBot {
+			return
+		}
+
 		if !user.MfaActive {
 			c.Err = model.NewAppError("", "api.context.mfa_required.app_error", nil, "MfaRequired", http.StatusForbidden)
 			return
@@ -133,10 +141,12 @@ func (c *Context) MfaRequired() {
 }
 
 func (c *Context) RemoveSessionCookie(w http.ResponseWriter, r *http.Request) {
+	subpath, _ := utils.GetSubpathFromConfig(c.App.Config())
+
 	cookie := &http.Cookie{
 		Name:     model.SESSION_COOKIE_TOKEN,
 		Value:    "",
-		Path:     "/",
+		Path:     subpath,
 		MaxAge:   -1,
 		HttpOnly: true,
 	}
@@ -182,7 +192,7 @@ func NewInvalidUrlParamError(parameter string) *model.AppError {
 }
 
 func (c *Context) SetPermissionError(permission *model.Permission) {
-	c.Err = model.NewAppError("Permissions", "api.context.permissions.app_error", nil, "userId="+c.App.Session.UserId+", "+"permission="+permission.Id, http.StatusForbidden)
+	c.Err = c.App.MakePermissionError(permission)
 }
 
 func (c *Context) SetSiteURLHeader(url string) {
@@ -517,5 +527,60 @@ func (c *Context) RequireRoleName() *Context {
 		c.SetInvalidUrlParam("role_name")
 	}
 
+	return c
+}
+
+func (c *Context) RequireGroupId() *Context {
+	if c.Err != nil {
+		return c
+	}
+
+	if len(c.Params.GroupId) != 26 {
+		c.SetInvalidUrlParam("group_id")
+	}
+	return c
+}
+
+func (c *Context) RequireRemoteId() *Context {
+	if c.Err != nil {
+		return c
+	}
+
+	if len(c.Params.RemoteId) == 0 {
+		c.SetInvalidUrlParam("remote_id")
+	}
+	return c
+}
+
+func (c *Context) RequireSyncableId() *Context {
+	if c.Err != nil {
+		return c
+	}
+
+	if len(c.Params.SyncableId) != 26 {
+		c.SetInvalidUrlParam("syncable_id")
+	}
+	return c
+}
+
+func (c *Context) RequireSyncableType() *Context {
+	if c.Err != nil {
+		return c
+	}
+
+	if c.Params.SyncableType != model.GroupSyncableTypeTeam && c.Params.SyncableType != model.GroupSyncableTypeChannel {
+		c.SetInvalidUrlParam("syncable_type")
+	}
+	return c
+}
+
+func (c *Context) RequireBotUserId() *Context {
+	if c.Err != nil {
+		return c
+	}
+
+	if len(c.Params.BotUserId) != 26 {
+		c.SetInvalidUrlParam("bot_user_id")
+	}
 	return c
 }
