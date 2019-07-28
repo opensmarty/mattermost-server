@@ -174,11 +174,12 @@ const (
 	PLUGIN_SETTINGS_DEFAULT_DIRECTORY        = "./plugins"
 	PLUGIN_SETTINGS_DEFAULT_CLIENT_DIRECTORY = "./client/plugins"
 
-	COMPLIANCE_EXPORT_TYPE_CSV         = "csv"
-	COMPLIANCE_EXPORT_TYPE_ACTIANCE    = "actiance"
-	COMPLIANCE_EXPORT_TYPE_GLOBALRELAY = "globalrelay"
-	GLOBALRELAY_CUSTOMER_TYPE_A9       = "A9"
-	GLOBALRELAY_CUSTOMER_TYPE_A10      = "A10"
+	COMPLIANCE_EXPORT_TYPE_CSV             = "csv"
+	COMPLIANCE_EXPORT_TYPE_ACTIANCE        = "actiance"
+	COMPLIANCE_EXPORT_TYPE_GLOBALRELAY     = "globalrelay"
+	COMPLIANCE_EXPORT_TYPE_GLOBALRELAY_ZIP = "globalrelay-zip"
+	GLOBALRELAY_CUSTOMER_TYPE_A9           = "A9"
+	GLOBALRELAY_CUSTOMER_TYPE_A10          = "A10"
 
 	CLIENT_SIDE_CERT_CHECK_PRIMARY_AUTH   = "primary"
 	CLIENT_SIDE_CERT_CHECK_SECONDARY_AUTH = "secondary"
@@ -2311,6 +2312,31 @@ func (s *DisplaySettings) SetDefaults() {
 	}
 }
 
+type GuestAccountsSettings struct {
+	Enable                           *bool
+	AllowEmailAccounts               *bool
+	EnforceMultifactorAuthentication *bool
+	RestrictCreationToDomains        *string
+}
+
+func (s *GuestAccountsSettings) SetDefaults() {
+	if s.Enable == nil {
+		s.Enable = NewBool(false)
+	}
+
+	if s.AllowEmailAccounts == nil {
+		s.AllowEmailAccounts = NewBool(true)
+	}
+
+	if s.EnforceMultifactorAuthentication == nil {
+		s.EnforceMultifactorAuthentication = NewBool(false)
+	}
+
+	if s.RestrictCreationToDomains == nil {
+		s.RestrictCreationToDomains = NewString("")
+	}
+}
+
 type ImageProxySettings struct {
 	Enable                  *bool
 	ImageProxyType          *string
@@ -2387,6 +2413,7 @@ type Config struct {
 	JobSettings             JobSettings
 	PluginSettings          PluginSettings
 	DisplaySettings         DisplaySettings
+	GuestAccountsSettings   GuestAccountsSettings
 	ImageProxySettings      ImageProxySettings
 }
 
@@ -2470,6 +2497,7 @@ func (o *Config) SetDefaults() {
 	o.JobSettings.SetDefaults()
 	o.MessageExportSettings.SetDefaults()
 	o.DisplaySettings.SetDefaults()
+	o.GuestAccountsSettings.SetDefaults()
 	o.ImageProxySettings.SetDefaults(o.ServiceSettings)
 }
 
